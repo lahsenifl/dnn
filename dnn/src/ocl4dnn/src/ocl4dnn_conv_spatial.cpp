@@ -48,6 +48,7 @@
 #include <vector>
 #include <fstream>
 #include <sys/stat.h>
+#include <assert.h>
 #include "../include/common.hpp"
 #include "../include/ocl4dnn.hpp"
 #include "opencl_kernels_dnn.hpp"
@@ -166,7 +167,6 @@ OCL4DNNConvSpatial<Dtype>::OCL4DNNConvSpatial(OCL4DNNConvConfig config)
     channels_   = config.in_shape[dims - spatial_dims - 1];
     num_output_ = config.out_shape[dims - spatial_dims - 1];
     group_ = config.group;
-    CV_CheckGT(group_, 0, "");  // avoid div by zero below
 
     fused_activ_ = OCL4DNN_CONV_FUSED_ACTIV_NONE;
     fused_eltwise_ = false;
@@ -181,11 +181,8 @@ OCL4DNNConvSpatial<Dtype>::OCL4DNNConvSpatial(OCL4DNNConvConfig config)
     // assumption: spatial dimension is 2.
     kernel_h_ = config.kernel.height;
     kernel_w_ = config.kernel.width;
-    // pads: [pad_top, pad_bottom, pad_left, pad_right]
-    pad_h_ = config.pads[0]; // pad_top
-    pad_bottom_ = config.pads[1];
-    pad_w_ = config.pads[2]; // pad_left
-    pad_right_ = config.pads[3];
+    pad_h_ = config.pad.height;
+    pad_w_ = config.pad.width;
     stride_h_ = config.stride.height;
     stride_w_ = config.stride.width;
     dilation_h_ = config.dilation.height;
@@ -197,6 +194,12 @@ OCL4DNNConvSpatial<Dtype>::OCL4DNNConvSpatial(OCL4DNNConvConfig config)
     output_w_ = config.out_shape[dims - spatial_dims + 1];
     bottom_dim_ = channels_ * width_ * height_;
     top_dim_ = num_output_ * output_w_ * output_h_;
+    int Ph = (output_h_ - 1) * stride_h_ + (dilation_h_ * (kernel_h_ - 1) + 1) - height_;
+    int Pw = (output_w_ - 1) * stride_w_ + (dilation_w_ * (kernel_w_ - 1) + 1) - width_;
+    Ph = (Ph > 0) ? Ph : 0;
+    Pw = (Pw > 0) ? Pw : 0;
+    pad_right_  = (Pw + 1) / 2;
+    pad_bottom_ = (Ph + 1) / 2;
 
     cache_path_ = utils::getConfigurationParameterString("OPENCV_OCL4DNN_CONFIG_PATH", "");
     dwconv_ = (num_output_ == channels_ && channels_ == group_);
@@ -215,7 +218,14 @@ OCL4DNNConvSpatial<Dtype>::OCL4DNNConvSpatial(OCL4DNNConvConfig config)
 #endif
         if (!use_cache_path_)
         {
-            CV_LOG_ONCE_ERROR(NULL, "OpenCV(ocl4dnn): Kernel configuration cache directory doesn't exist: " << cache_path_);
+            static int warn_ = 0;
+            if (!warn_)
+            {
+                std::cerr
+                    << "OpenCV(ocl4dnn): Kernel configuration cache directory doesn't exist: " << cache_path_ << std::endl
+                    << std::endl;
+                warn_ = true;
+            }
         }
     }
 
@@ -260,21 +270,17 @@ void OCL4DNNConvSpatial<Dtype>::setFusionDefine(ocl4dnnFusedActiv_t fused_activ,
 }
 
 template<typename Dtype>
-void OCL4DNNConvSpatial<Dtype>::setFusionArg(ocl4dnnFusedActiv_t fused_activ, bool fused_eltwise, int fused_eltwise_offset, ocl::Kernel &kernel, cl_uint &argIdx)
+void OCL4DNNConvSpatial<Dtype>::setFusionArg(ocl4dnnFusedActiv_t fused_activ, bool fused_eltwise, ocl::Kernel &kernel, cl_uint &argIdx)
 {
     if (fused_eltwise)
-    {
-        kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom_data2_));
-        if (fused_eltwise_offset >= 0)
-            kernel.set(argIdx++, fused_eltwise_offset);
-    }
+        kernel.set(argIdx++, (cl_mem)bottom_data2_.handle(ACCESS_READ));
 
     switch (fused_activ) {
         case OCL4DNN_CONV_FUSED_ACTIV_RELU:
             kernel.set(argIdx++, (float)negative_slope_);
             break;
         case OCL4DNN_CONV_FUSED_ACTIV_PRELU:
-            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(negative_slope_umat_));
+            kernel.set(argIdx++, (cl_mem)negative_slope_umat_.handle(ACCESS_READ));
             break;
         case OCL4DNN_CONV_FUSED_ACTIV_POWER:
             kernel.set(argIdx++, (float)power_);
@@ -408,6 +414,7 @@ void OCL4DNNConvSpatial<Dtype>::setupKernelDetails(int32_t kernelType,
         addDef("CHANNELS", channels_ / group_);
         addDef("APPLY_BIAS", bias_term_);
         addDef("OUTPUT_Z", M_);
+        addDef("ZPAR", 1);
         setFusionDefine(fused_activ_, fused_eltwise_);
 
         src_ = cv::ocl::dnn::conv_layer_spatial_oclsrc;
@@ -581,16 +588,16 @@ bool OCL4DNNConvSpatial<Dtype>::Forward(const UMat& bottom,
         fused_eltwise_ = false;
     }
 
-    if (use_half_ && !bias.empty())
-        CV_CheckTypeEQ(bias.type(), CV_16SC1, "");
+    if (use_half_ && bias_half.empty() && !bias.empty())
+        convertFp16(bias, bias_half);
 
-    if (use_half_)
-        CV_CheckTypeEQ(weight.type(), CV_16SC1, "");
+    if (use_half_ && weights_half.empty())
+        convertFp16(weight, weights_half);
 
-    prepareKernel(bottom, top, weight, bias, numImages);
+    prepareKernel(bottom, top, weight, (use_half_) ? bias_half : bias, numImages);
     if (bestKernelConfig.empty())
         return false;
-    return convolve(bottom, top, weight, bias, numImages, bestKernelConfig);
+    return convolve(bottom, top, weight, (use_half_) ? bias_half : bias, numImages, bestKernelConfig);
 }
 
 template<typename Dtype>
@@ -600,7 +607,6 @@ void OCL4DNNConvSpatial<Dtype>::calculateBenchmark(const UMat &bottom, UMat &ver
 {
     options_.str(""); options_.clear(); // clear contents and state flags
     createBasicKernel(1, 1, 1);
-    CV_Assert(!kernelQueue.empty());  // basic kernel must be available
     kernel_index_ = kernelQueue.size() - 1;
     convolve(bottom, verifyTop, weight, bias, numImages, kernelQueue[kernel_index_]);
     CV_Assert(phash.find(kernelQueue[kernel_index_]->kernelName) != phash.end());
@@ -661,7 +667,8 @@ void interleaveMatrix(Dtype* mem_dst, const Dtype *mem,
                       int r, int c, int interleavedRows, int nonInterleavedRows,
                       int blockWidth, int rowAlignment )
 {
-    CV_Check(interleavedRows, interleavedRows % 2 == 0, "interleaveMatrix only supports even values for interleavedRows.");
+    CHECK_EQ(interleavedRows % 2, 0) <<
+             "interleaveMatrix only supports even values for interleavedRows.";
 
     size_t memSize = r * c * sizeof(float);
     size_t dstSize = memSize *
@@ -673,12 +680,9 @@ void interleaveMatrix(Dtype* mem_dst, const Dtype *mem,
     const int yStride = c * 2;
     const Dtype *pSrc = mem;
     Dtype* pDst = mem_dst;
-    for (int y = 0; y < r;)
-    {
-        for (int rows = 0; rows < interleavedRows; rows += 2)
-        {
-            if (y >= r)
-                break;
+    for (int y = 0; y < r;) {
+        for (int rows = 0; rows < interleavedRows; rows += 2) {
+            if ( y >= r ) break;
             if ((c % xStride) == 0) {
                 for (int x = 0; x < c / xStride; x++) {
                     memcpy(pDst + x * xStride * 2,                         // NOLINT
@@ -703,14 +707,11 @@ void interleaveMatrix(Dtype* mem_dst, const Dtype *mem,
             y += 2;
         }
 
-        for (int rows = 0; rows < nonInterleavedRows; rows++)
-        {
-            if (y >= r)
-                break;
+        for (int rows = 0; rows < nonInterleavedRows; rows++) {
+            if (y >= r) break;
             const int stride = rowAlignment;
             int remaining = c;
-            for (int x = 0; x < c; x += stride)
-            {
+            for (int x = 0; x < c; x += stride) {
                 if (remaining >= stride) {
                     memcpy(pDst + x * 2, pSrc + x, stride * sizeof(Dtype));    // NOLINT
                     remaining -=stride;
@@ -742,54 +743,47 @@ bool OCL4DNNConvSpatial<Dtype>::swizzleWeight(const UMat &weight,
                                      kernel_h_ * (int)alignSize(kernel_w_, 2),
                                      (use_half_) ? CV_16SC1 : CV_32FC1);
 
+    UMat swizzled_weights_tmp;
+    if (use_half_)
+        swizzled_weights_tmp.create(shape(swizzled_weights_umat), CV_32F);
+
     if (!interleave) {
+        cl_uint argIdx = 0;
         int32_t channels = channels_ / group_;
 
-        ocl::Kernel oclk_copy_weight(
-            use_half_ ? "copyWeightsSwizzled_half" : "copyWeightsSwizzled_float",
-            cv::ocl::dnn::conv_spatial_helper_oclsrc,
-            use_half_ ? "-DHALF_SUPPORT=1 -DDtype=half" : "-DDtype=float"
-        );
+        ocl::Kernel oclk_copy_weight(CL_KERNEL_SELECT("copyWeightsSwizzled"),
+                                     cv::ocl::dnn::conv_spatial_helper_oclsrc);
         if (oclk_copy_weight.empty())
             return false;
 
-        oclk_copy_weight.args(
-            ocl::KernelArg::PtrReadOnly(weight),
-            ocl::KernelArg::PtrWriteOnly(swizzled_weights_umat),
-            kernel_w_,
-            kernel_h_,
-            channels,
-            num_output_,
-            swizzled_factor
-        );
+        oclk_copy_weight.set(argIdx++, ocl::KernelArg::PtrReadOnly(weight));
+        if (use_half_)
+            oclk_copy_weight.set(argIdx++, ocl::KernelArg::PtrWriteOnly(swizzled_weights_tmp));
+        else
+            oclk_copy_weight.set(argIdx++, ocl::KernelArg::PtrWriteOnly(swizzled_weights_umat));
+        oclk_copy_weight.set(argIdx++, kernel_w_);
+        oclk_copy_weight.set(argIdx++, kernel_h_);
+        oclk_copy_weight.set(argIdx++, channels);
+        oclk_copy_weight.set(argIdx++, num_output_);
+        oclk_copy_weight.set(argIdx++, swizzled_factor);
 
-        size_t global_work_size_copy[1] = { (size_t)(alignSize(num_output_, swizzled_factor) * channels * kernel_w_ * kernel_h_) };
+        size_t global_work_size_copy[3] = {
+            (size_t) (alignSize(num_output_, swizzled_factor) * channels * kernel_w_ * kernel_h_), 1, 1 };
 
-        if (!oclk_copy_weight.run_(1, global_work_size_copy, NULL, false))
+        if (!oclk_copy_weight.run(3, global_work_size_copy, NULL, false))
         {
-            CV_LOG_ERROR(NULL, "DNN/OpenCL: Swizzle kernel run failed");
+            std::cout << "Swizzle kernel run failed." << std::endl;
             return false;
         }
     } else {
         // assumption: kernel dimension is 2
-        Mat weightMat;
-        Mat swizzledWeightMat;
-        UMat weight_tmp; // FP32 in half mode, TODO implement FP16 repack
-        if (use_half_)
-        {
-            CV_CheckTypeEQ(weight.type(), CV_16SC1, "");
-            convertFp16(weight, weight_tmp);
-            weightMat = weight_tmp.getMat(ACCESS_READ);
-            swizzledWeightMat.create(shape(swizzled_weights_umat), CV_32F);
-        }
-        else
-        {
-            weightMat = weight.getMat(ACCESS_READ);
-            swizzledWeightMat = swizzled_weights_umat.getMat(ACCESS_WRITE);
-        }
-
-        CV_CheckTypeEQ(weightMat.type(), CV_32FC1, "");
+        Mat weightMat = weight.getMat(ACCESS_READ);
         Dtype* cpu_weight = (Dtype *)weightMat.ptr<float>();
+        Mat swizzledWeightMat;
+        if (use_half_)
+            swizzledWeightMat = swizzled_weights_tmp.getMat(ACCESS_WRITE);
+        else
+            swizzledWeightMat = swizzled_weights_umat.getMat(ACCESS_WRITE);
         Dtype* cpu_swizzled_weight = (Dtype *)swizzledWeightMat.ptr<float>();
 
         int interleavedRows = (kernel_w_ / 2) * 2;
@@ -797,28 +791,26 @@ bool OCL4DNNConvSpatial<Dtype>::swizzleWeight(const UMat &weight,
         int blockWidth = swizzled_factor;  // should equal to simd size.
         int rowAlignment = 32;
         size_t interleaved_filter_size = M_ * kernel_w_ * kernel_h_ * channels_ * sizeof(Dtype);
-        cv::AutoBuffer<Dtype, 0> tmpSwizzledWeight(interleaved_filter_size);
+        Dtype * tmpSwizzledWeight = reinterpret_cast<Dtype*>(malloc(interleaved_filter_size));
+        CHECK_EQ(tmpSwizzledWeight != NULL, true) << "Failed to allocate temporary swizzled weight";
         for (int od = 0; od < M_; od++)
             for (int id = 0; id < channels_; id++)
                 for (int r = 0; r < kernel_h_; r++)
                     for (int c = 0; c < kernel_w_; c++)
                         tmpSwizzledWeight[((id * kernel_h_ + r)* kernel_w_ + c) * M_ + od] =
                             cpu_weight[((od * channels_ + id) * kernel_h_ + r)*kernel_w_+c];
-
         interleaveMatrix(cpu_swizzled_weight,
-                         tmpSwizzledWeight.data(),
+                         tmpSwizzledWeight,
                          kernel_w_ * kernel_h_ * channels_, M_,
                          interleavedRows,
                          nonInterleavedRows,
                          blockWidth,
                          rowAlignment);
-
-        // unmap OpenCL buffers
-        weightMat.release();
-
-        if (use_half_)
-            convertFp16(swizzledWeightMat, swizzled_weights_umat);
+        free(tmpSwizzledWeight);
     }
+
+    if (use_half_)
+        convertFp16(swizzled_weights_tmp, swizzled_weights_umat);
 
     return true;
 }
@@ -847,6 +839,34 @@ bool OCL4DNNConvSpatial<float>::createBasicKernel(int32_t blockWidth,
 }
 
 template<>
+void OCL4DNNConvSpatial<float>::CreateSubBuffer(const UMat& buffer, UMat& sub_buffer,
+                                                int32_t offset, int32_t size, bool write_only)
+{
+    cl_mem sub_mem;
+    cl_buffer_region region;
+    cl_int err;
+    size_t element_size = (use_half_) ? sizeof(short) : sizeof(float);
+
+    region.origin = offset * element_size + buffer.offset;
+    region.size = size * element_size;
+    sub_mem = clCreateSubBuffer((cl_mem)buffer.handle(ACCESS_READ),
+                                write_only ? CL_MEM_WRITE_ONLY : CL_MEM_READ_ONLY,
+                                CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
+    if (err)
+    {
+        std::cout << "Failed to create sub buffer." << std::endl;
+        return;
+    }
+
+    int step = element_size, rows = size, cols = 1;
+    ocl::convertFromBuffer(sub_mem, step, rows, cols,
+                           (use_half_) ? CV_16SC1 : CV_32FC1, sub_buffer);
+
+    //decrease ocl mem refcount
+    clReleaseMemObject(sub_mem);
+}
+
+template<>
 bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
                                          const UMat &weight, const UMat &bias,
                                          int32_t numImages, kernelConfig* config)
@@ -864,12 +884,10 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
     if (config->kernelType == KERNEL_TYPE_INTEL_IDLF) {
         if (!swizzleWeight(weight, config->workItem_output[2], false))
             return false;
-#if 0
         size_t total_bottom_size = bottom_dim_ * numImages;
         size_t total_kernel_size = kernel_h_ * kernel_w_ * channels_ * M_;
         size_t total_bias_size = M_ * group_;
         size_t total_top_size = top_dim_ * numImages;
-#endif
         for (int32_t g = 0; g < group_; ++g) {
             bias_offset = M_ * g;
             int32_t image_offset = width_ * height_ * (channels_ / group_) * g;
@@ -881,41 +899,89 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
                 return false;
 
             cl_uint argIdx = 0;
-            setFusionArg(fused_activ_, fused_eltwise_, output_image_offset, kernel, argIdx);
+            setFusionArg(fused_activ_, fused_eltwise_, kernel, argIdx);
 
-            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom));
-            kernel.set(argIdx++, image_offset);
-
-            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(swizzled_weights_umat));
-            kernel.set(argIdx++, kernel_offset);
-
-            if (bias_term_)
+            UMat img_buffer;
+            if (image_offset)
             {
-                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias));
-                kernel.set(argIdx++, bias_offset);
+                CreateSubBuffer(bottom, img_buffer, image_offset,
+                                total_bottom_size - image_offset, false);
+                if (img_buffer.empty())
+                    return false;
+
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(img_buffer));
+            }
+            else
+            {
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom));
             }
 
-            kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(top));
-            kernel.set(argIdx++, (int)(top.offset / element_size) + output_image_offset);
+            UMat kernel_buffer;
+            if (kernel_offset)
+            {
+                CreateSubBuffer(swizzled_weights_umat, kernel_buffer, kernel_offset,
+                                total_kernel_size - kernel_offset, false);
+                if (kernel_buffer.empty())
+                    return false;
+
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(kernel_buffer));
+            }
+            else
+            {
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(swizzled_weights_umat));
+            }
+
+            UMat bias_buffer;
+            if (bias_term_)
+            {
+                if (bias_offset)
+                {
+                    CreateSubBuffer(bias, bias_buffer, bias_offset,
+                                    total_bias_size - bias_offset, false);
+                    if (bias_buffer.empty())
+                        return false;
+
+                    kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias_buffer));
+                }
+                else
+                {
+                    kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias));
+                }
+            }
+
+            UMat out_buffer;
+            if (output_image_offset)
+            {
+                CreateSubBuffer(top, out_buffer, output_image_offset,
+                                total_top_size - output_image_offset, true);
+                if (out_buffer.empty())
+                    return false;
+
+                kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(out_buffer));
+                kernel.set(argIdx++, (int)(out_buffer.offset / element_size));
+            }
+            else
+            {
+                kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(top));
+                kernel.set(argIdx++, (int)(top.offset / element_size));
+            }
 
             kernel.set(argIdx++, (uint16_t)width_);
             kernel.set(argIdx++, (uint16_t)height_);
             kernel.set(argIdx++, (uint16_t)output_w_);
             kernel.set(argIdx++, (uint16_t)output_h_);
-            if (!kernel.run_(3, config->global_work_size, config->local_work_size, false))
+            if (!kernel.run(3, config->global_work_size, config->local_work_size, false))
             {
-                CV_LOG_ERROR(NULL, "DNN/OpenCL: IDLF kernel run failed");
+                std::cout << "IDLF kernel run failed." << std::endl;
                 return false;
             }
         }
     } else if (config->kernelType == KERNEL_TYPE_GEMM_LIKE) {
         if (!swizzleWeight(weight, config->workItem_output[1], true))
             return false;
-#if 0
         size_t total_bottom_size = bottom_dim_ * numImages;
         size_t total_kernel_size = kernel_h_ * kernel_w_ * channels_ * M_;
         size_t total_bias_size = M_ * group_;
-#endif
         size_t total_top_size = top_dim_ * numImages;
         for (int32_t g = 0; g < group_; ++g) {
             bias_offset = M_ * g;
@@ -928,25 +994,72 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
                 return false;
 
             cl_uint argIdx = 0;
-            setFusionArg(fused_activ_, fused_eltwise_, output_image_offset, kernel, argIdx);
+            setFusionArg(fused_activ_, fused_eltwise_, kernel, argIdx);
 
-            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom));
-            kernel.set(argIdx++, (int)image_offset);
-            kernel.set(argIdx++, (int)(bottom.total() - image_offset));
-
-            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(swizzled_weights_umat));
-            kernel.set(argIdx++, (int)kernel_offset);
-            kernel.set(argIdx++, (int)(swizzled_weights_umat.total() - kernel_offset));
-
-            if (bias_term_)
+            UMat img_buffer;
+            if (image_offset)
             {
-                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias));
-                kernel.set(argIdx++, (int)bias_offset);
+                CreateSubBuffer(bottom, img_buffer, image_offset,
+                                total_bottom_size - image_offset, false);
+                if (img_buffer.empty())
+                    return false;
+
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(img_buffer));
+            }
+            else
+            {
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom));
             }
 
-            kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(top));
-            kernel.set(argIdx++, (int)(top.offset / element_size) + output_image_offset);
-            kernel.set(argIdx++, (int)total_top_size - (int)(top.offset / element_size));
+            UMat kernel_buffer;
+            if (kernel_offset)
+            {
+                CreateSubBuffer(swizzled_weights_umat, kernel_buffer, kernel_offset,
+                                total_kernel_size - kernel_offset, false);
+                if (kernel_buffer.empty())
+                    return false;
+
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(kernel_buffer));
+            }
+            else
+            {
+                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(swizzled_weights_umat));
+            }
+
+            UMat bias_buffer;
+            if (bias_term_)
+            {
+                if (bias_offset)
+                {
+                    CreateSubBuffer(bias, bias_buffer, bias_offset,
+                                    total_bias_size - bias_offset, false);
+                    if (bias_buffer.empty())
+                        return false;
+
+                    kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias_buffer));
+                }
+                else
+                {
+                    kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias));
+                }
+            }
+
+            UMat out_buffer;
+            if (output_image_offset)
+            {
+                CreateSubBuffer(top, out_buffer, output_image_offset,
+                                total_top_size - output_image_offset, true);
+                if (out_buffer.empty())
+                    return false;
+
+                kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(out_buffer));
+                kernel.set(argIdx++, (int)(out_buffer.offset / element_size));
+            }
+            else
+            {
+                kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(top));
+                kernel.set(argIdx++, (int)(top.offset / element_size));
+            }
 
             kernel.set(argIdx++, (uint16_t)width_);
             kernel.set(argIdx++, (uint16_t)height_);
@@ -976,9 +1089,9 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
             gy = alignSize(gy, blockK);
             size_t global_size[3] = { gx, gy, config->global_work_size[2] };
 
-            if (!kernel.run_(3, global_size, config->local_work_size, false))
+            if (!kernel.run(3, global_size, config->local_work_size, false))
             {
-                CV_LOG_ERROR(NULL, "DNN/OpenCL: GEMM like kernel run failed");
+                std::cout << "GEMM like kernel run failed." << std::endl;
                 return false;
             }
         }
@@ -988,9 +1101,12 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
             return false;
 
         cl_uint argIdx = 0;
-        setFusionArg(fused_activ_, fused_eltwise_, -1, kernel, argIdx);
+        setFusionArg(fused_activ_, fused_eltwise_, kernel, argIdx);
         kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom));
-        kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(weight));
+        if (use_half_)
+            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(weights_half));
+        else
+            kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(weight));
         if (bias_term_)
             kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias));
         kernel.set(argIdx++, ocl::KernelArg::PtrWriteOnly(top));
@@ -1000,17 +1116,14 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
         kernel.set(argIdx++, (uint16_t)output_w_);
         kernel.set(argIdx++, (uint16_t)output_h_);
 
-        size_t wgs = kernel.workGroupSize();
-        if (!wgs)
+        size_t global_size[3];
+        global_size[0] = output_w_;
+        global_size[1] = output_h_;
+        global_size[2] = num_output_ * num_;
+
+        if (!kernel.run(3, global_size, NULL, false))
         {
-            CV_LOG_ERROR(NULL, "DNN/OpenCL: Can't query workGroupSize of DWCONV kernel");
-            return false;
-        }
-        size_t lws[1] = { wgs };
-        size_t gws[1] = { roundUp((size_t)output_w_ * output_h_ * num_output_ * num_, (unsigned)lws[0]) };
-        if (!kernel.run_(1, gws, lws, false))
-        {
-            CV_LOG_ERROR(NULL, "DNN/OpenCL: DWCONV kernel run failed");
+            std::cout << "DWCONV kernel run failed." << std::endl;
             return false;
         }
     } else {
@@ -1031,10 +1144,13 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
                     return false;
 
                 cl_uint argIdx = 0;
-                setFusionArg(fused_activ_, fused_eltwise_, -1, kernel, argIdx);
+                setFusionArg(fused_activ_, fused_eltwise_, kernel, argIdx);
                 kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bottom));
                 kernel.set(argIdx++, image_offset);
-                kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(weight));
+                if (use_half_)
+                    kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(weights_half));
+                else
+                    kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(weight));
                 kernel.set(argIdx++, kernel_offset);
                 if (bias_term_)
                     kernel.set(argIdx++, ocl::KernelArg::PtrReadOnly(bias));
@@ -1050,18 +1166,11 @@ bool OCL4DNNConvSpatial<float>::convolve(const UMat &bottom, UMat &top,
                 kernel.set(argIdx++, (uint16_t)output_h_);
                 kernel.set(argIdx++, (uint16_t)pad_w_);
                 kernel.set(argIdx++, (uint16_t)pad_h_);
-
-                size_t wgs = kernel.workGroupSize();
-                if (!wgs)
+                if (!kernel.run(3, config->global_work_size,
+                                (config->use_null_local) ? NULL : config->local_work_size,
+                                false))
                 {
-                    CV_LOG_ERROR(NULL, "DNN/OpenCL: Can't query workGroupSize of Basic kernel");
-                    return false;
-                }
-                size_t lws[1] = { wgs };
-                size_t gws[1] = { roundUp((size_t)output_w_ * output_h_ * M_, (unsigned)lws[0]) };
-                if (!kernel.run_(1, gws, lws, false))
-                {
-                    CV_LOG_ERROR(NULL, "DNN/OpenCL: Basic kernel run failed");
+                    std::cout << "Basic kernel run failed." << std::endl;
                     return false;
                 }
             }
@@ -1081,9 +1190,14 @@ float OCL4DNNConvSpatial<float>::timedConvolve(const UMat &bottom, UMat &top,
     {
         queue = cv::ocl::Queue::getDefault();
     }
-    catch (const std::exception& e)
+    catch (const cv::Exception&)
     {
-        CV_LOG_ONCE_ERROR(NULL, "OpenCV(ocl4dnn): Can't get OpenCL default queue for auto-tuning: " << e.what());
+        static int warn_ = 0;
+        if (!warn_)
+        {
+            std::cout << "OpenCV(ocl4dnn): Can't get OpenCL default queue for auto-tuning." << std::endl;
+            warn_ = true;
+        }
         return 1e6;
     }
 
@@ -1138,11 +1252,8 @@ bool OCL4DNNConvSpatial<float>::verifyResult(const UMat &bottom,
     else if (config->tested)
         return false;
 
-    //int32_t sz[4] = {numImages, num_output_, output_h_, output_w_};
-    CV_CheckEQ(top.total(), (size_t)numImages * num_output_ * output_h_ * output_w_, "");
-    CV_CheckTypeEQ(top.type(), (use_half_) ? CV_16SC1 : CV_32FC1, "");
-    top.setTo(Scalar::all(0));
-
+    int32_t sz[4] = {numImages, num_output_, output_h_, output_w_};
+    top.zeros(4, sz, (use_half_) ? CV_16SC1 : CV_32FC1);
     bool saved_tuned = tuned_;
     tuned_ = false;
     convolve(bottom, top, weight, bias, numImages, config);
@@ -1287,9 +1398,9 @@ ocl::Program OCL4DNNConvSpatial<Dtype>::compileKernel()
     phash.insert(std::pair<std::string, ocl::Program>(kernel_name_, program));
     if (!program.ptr())
     {
-        CV_LOG_WARNING(NULL, "DNN/OpenCL: Failed to compile kernel: " << kernel_name_
-            << ", buildflags: '" << options << "', errmsg: '" << errmsg << "'"
-        );
+        std::cout << "Failed to compile kernel: " << kernel_name_
+                  << ", buildflags: " << options
+                  << ", errmsg: " << errmsg << std::endl;
     }
     return program;
 }
@@ -1318,13 +1429,26 @@ bool OCL4DNNConvSpatial<float>::createGEMMLikeConvKernel(int32_t blockM,
     ocl::Program program = compileKernel();
     if (program.ptr())
     {
+        size_t workgroupSize_used;
         ocl::Kernel kernel(kernel_name_.c_str(), program);
         if (kernel.empty())
             return false;
 
-        kernelQueue.push_back(makePtr<kernelConfig>(kernel_name_, &global_size[0], &local_size[0], &workItemOutput[0],
-                                                    true, KERNEL_TYPE_GEMM_LIKE));
-        return true;
+        workgroupSize_used = kernel.preferedWorkGroupSizeMultiple();
+        if (workgroupSize_used != simd_size)
+        {
+            std::cerr << "OpenCV(ocl4dnn): The OpenCL compiler chose a simd size (" << workgroupSize_used << ") that " << std::endl;
+            std::cerr << "                 does not equal the size (" << simd_size << ") kernel source required." << std::endl;
+            std::cerr << "                 Skip this kernel " << kernel_name_ << std::endl;
+            unloadProgram(kernel_name_);
+            return false;
+        }
+        else
+        {
+            kernelQueue.push_back(makePtr<kernelConfig>(kernel_name_, &global_size[0], &local_size[0], &workItemOutput[0],
+                                                        true, KERNEL_TYPE_GEMM_LIKE));
+            return true;
+        }
     }
     else
         return false;
@@ -1370,13 +1494,26 @@ bool OCL4DNNConvSpatial<float>::createIDLFKernel(int32_t blockWidth,
     ocl::Program program = compileKernel();
     if (program.ptr())
     {
+        size_t workgroupSize_used;
         ocl::Kernel kernel(kernel_name_.c_str(), program);
         if (kernel.empty())
             return false;
 
-        kernelQueue.push_back(makePtr<kernelConfig>(kernel_name_, &global_size[0], &local_size[0], &workItemOutput[0],
-                                                    true, KERNEL_TYPE_INTEL_IDLF));
-        return true;
+        workgroupSize_used = kernel.preferedWorkGroupSizeMultiple();
+        if (workgroupSize_used != simd_size)
+        {
+            std::cerr << "OpenCV(ocl4dnn): The OpenCL compiler chose a simd size (" << workgroupSize_used << ") that " << std::endl;
+            std::cerr << "                 does not equal the size (" << simd_size << ") kernel source required." << std::endl;
+            std::cerr << "                 Skip this kernel " << kernel_name_ << std::endl;
+            unloadProgram(kernel_name_);
+            return false;
+        }
+        else
+        {
+            kernelQueue.push_back(makePtr<kernelConfig>(kernel_name_, &global_size[0], &local_size[0], &workItemOutput[0],
+                                                        true, KERNEL_TYPE_INTEL_IDLF));
+            return true;
+        }
     }
     else
         return false;
@@ -1576,7 +1713,6 @@ void OCL4DNNConvSpatial<float>::useFirstAvailable(const UMat &bottom,
                                     tunerItems[i]->blockHeight,
                                     tunerItems[i]->blockDepth))
         {
-            CV_Assert(!kernelQueue.empty());  // basic kernel must be available
             int kernelIdx = kernelQueue.size() - 1;
             kernelConfig* config = kernelQueue[kernelIdx].get();
             bool failed = false;
@@ -1715,8 +1851,7 @@ void OCL4DNNConvSpatial<float>::setupConvolution(const UMat &bottom,
                     fastestTime = kernelQueue[x]->executionTime;
                 }
             }
-            if (fastestKernel < 0)
-                break;
+            if (fastestKernel < 0) break;
             // Test fastest kernel
             bool verified = verifyResult(bottom, top, weight, bias, numImages, kernelQueue[fastestKernel], verifyTop);
             if (verified == true) {
@@ -1748,7 +1883,6 @@ void OCL4DNNConvSpatial<float>::setupConvolution(const UMat &bottom,
         CV_LOG_INFO(NULL, "fallback to basic kernel");
         options_.str(""); options_.clear(); // clear contents and state flags
         createBasicKernel(1, 1, 1);
-        CV_Assert(!kernelQueue.empty());  // basic kernel must be available
         kernel_index_ = kernelQueue.size() - 1;
     }
     this->bestKernelConfig = kernelQueue[kernel_index_];
@@ -1819,7 +1953,7 @@ void OCL4DNNConvSpatial<Dtype>::prepareKernel(const UMat &bottom, UMat &top,
 
     UMat benchData(1, numImages * top_dim_, (use_half_) ? CV_16SC1 : CV_32FC1);
 
-    calculateBenchmark(bottom, benchData, weight, bias, numImages);
+    calculateBenchmark(bottom, benchData, (use_half_) ? weights_half : weight, bias, numImages);
 
     if (run_auto_tuning_ || force_auto_tuning_)
     {
@@ -1875,18 +2009,17 @@ bool OCL4DNNConvSpatial<Dtype>::setupKernelByConfig(int x, int y, int z, int typ
     {
         if (z == 1)
             z = 16;
-        CV_Check(z, z == 16 || z == 8, "DNN/OpenCL: IDLF - invalid SIMD size");
+        CHECK_EQ(z == 16 || z == 8, true) << "invalid SIMD size" << std::endl;
     }
     kernelQueue.clear();
     createConvolutionKernel(type, x, y, z);
-    if (kernelQueue.size() != 1)
-    {
-        CV_LOG_ERROR(NULL, "DNN/OpenCL: Failed setup kernel by config: "
+    if (kernelQueue.size() != 1) {
+        std::cerr << "Failed setup kernel by config:"
             << " x = " << x
             << " y = " << y
             << " z = " << z
             << " type = " << type
-        );
+            << std::endl;
         return false;
     }
     bestKernelConfig = kernelQueue[0];
@@ -1918,9 +2051,13 @@ bool OCL4DNNConvSpatial<Dtype>::loadTunedConfig()
     {
         if (cache_path_.empty())
         {
-            CV_LOG_ONCE_WARNING(NULL, "OpenCV(ocl4dnn): consider to specify kernel configuration cache directory "
-                "through OPENCV_OCL4DNN_CONFIG_PATH parameter."
-            );
+            static int warn_ = 0;
+            if (!warn_)
+            {
+                std::cout << "OpenCV(ocl4dnn): consider to specify kernel configuration cache directory " << std::endl
+                          << "                 via OPENCV_OCL4DNN_CONFIG_PATH parameter." << std::endl;
+                warn_ = true;
+            }
         }
         return false;
     }

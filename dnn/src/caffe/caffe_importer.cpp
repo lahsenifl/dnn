@@ -49,18 +49,16 @@
 #include <google/protobuf/message.h>
 #include <google/protobuf/text_format.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
-#include <google/protobuf/reflection.h>
 #include "caffe_io.hpp"
 #endif
-
-#include <opencv2/core/utils/fp_control_utils.hpp>
 
 namespace cv {
 namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
 
 #ifdef HAVE_PROTOBUF
-using ::google::protobuf::RepeatedFieldRef;
+using ::google::protobuf::RepeatedField;
+using ::google::protobuf::RepeatedPtrField;
 using ::google::protobuf::Message;
 using ::google::protobuf::Descriptor;
 using ::google::protobuf::FieldDescriptor;
@@ -77,31 +75,18 @@ static cv::String toString(const T &v)
     return ss.str();
 }
 
-static inline
-MatShape parseBlobShape(const caffe::BlobShape& _input_shape)
-{
-    MatShape shape;
-    for (int i = 0; i < _input_shape.dim_size(); i++)
-    {
-        shape.push_back((int)_input_shape.dim(i));
-    }
-    return shape;
-}
-
 class CaffeImporter
 {
-    FPDenormalsIgnoreHintScope fp_denormals_ignore_scope;
-
     caffe::NetParameter net;
     caffe::NetParameter netBinary;
 
 public:
 
-    CaffeImporter(const char *prototxt, const char *caffeModel)
+    CaffeImporter(const char *pototxt, const char *caffeModel)
     {
         CV_TRACE_FUNCTION();
 
-        ReadNetParamsFromTextFileOrDie(prototxt, &net);
+        ReadNetParamsFromTextFileOrDie(pototxt, &net);
 
         if (caffeModel && caffeModel[0])
             ReadNetParamsFromBinaryFileOrDie(caffeModel, &netBinary);
@@ -125,7 +110,6 @@ public:
         {
             const google::protobuf::UnknownField& field = unknownFields.field(i);
             CV_Assert(field.type() == google::protobuf::UnknownField::TYPE_GROUP);
-            CV_CheckGE(field.group().field_count(), 2, "UnknownField should have at least 2 items: name and value");
             std::string fieldName = field.group().field(0).length_delimited();
             std::string fieldValue = field.group().field(1).length_delimited();
             params.set(fieldName, fieldValue);
@@ -141,7 +125,7 @@ public:
 
         #define SET_UP_FILED(getter, arrayConstr, gtype)                                    \
             if (isRepeated) {                                                               \
-                const RepeatedFieldRef<gtype> v = refl->GetRepeatedFieldRef<gtype>(msg, field);  \
+                const RepeatedField<gtype> &v = refl->GetRepeatedField<gtype>(msg, field);  \
                 params.set(name, DictValue::arrayConstr(v.begin(), (int)v.size()));                  \
             }                                                                               \
             else {                                                                          \
@@ -173,7 +157,7 @@ public:
             break;
         case FieldDescriptor::CPPTYPE_STRING:
             if (isRepeated) {
-                const RepeatedFieldRef<std::string> v = refl->GetRepeatedFieldRef<std::string>(msg, field);
+                const RepeatedPtrField<std::string> &v = refl->GetRepeatedPtrField<std::string>(msg, field);
                 params.set(name, DictValue::arrayString(v.begin(), (int)v.size()));
             }
             else {
@@ -194,6 +178,7 @@ public:
             break;
         default:
             CV_Error(Error::StsError, "Unknown type \"" + String(field->type_name()) + "\" in prototxt");
+            break;
         }
     }
 
@@ -250,7 +235,10 @@ public:
         }
         else if (pbBlob.has_shape())
         {
-            shape = parseBlobShape(pbBlob.shape());
+            const caffe::BlobShape &_shape = pbBlob.shape();
+
+            for (int i = 0; i < _shape.dim_size(); i++)
+                shape.push_back((int)_shape.dim(i));
         }
         else
             shape.resize(1, 1);  // Is a scalar.
@@ -310,13 +298,16 @@ public:
 
         caffe::LayerParameter* binLayer = netBinary.mutable_layer(li);
         const int numBlobs = binLayer->blobs_size();
-        std::vector<caffe::BlobProto*> blobs(numBlobs);
-        binLayer->mutable_blobs()->ExtractSubrange(0, numBlobs, blobs.data());
         layerParams.blobs.resize(numBlobs);
         for (int bi = 0; bi < numBlobs; bi++)
         {
-            blobFromProto(*blobs[bi], layerParams.blobs[bi]);
-            delete blobs[bi];
+            blobFromProto(binLayer->blobs(bi), layerParams.blobs[bi]);
+        }
+        binLayer->clear_blobs();
+        CV_Assert(numBlobs == binLayer->blobs().ClearedCount());
+        for (int bi = 0; bi < numBlobs; bi++)
+        {
+            delete binLayer->mutable_blobs()->ReleaseCleared();
         }
     }
 
@@ -343,48 +334,11 @@ public:
 
         //setup input layer names
         std::vector<String> netInputs(net.input_size());
-        std::vector<MatShape> inp_shapes;
         {
-            int net_input_size = net.input_size();
-            for (int inNum = 0; inNum < net_input_size; inNum++)
+            for (int inNum = 0; inNum < net.input_size(); inNum++)
             {
                 addedBlobs.push_back(BlobNote(net.input(inNum), 0, inNum));
                 netInputs[inNum] = net.input(inNum);
-            }
-
-            if (net.input_dim_size() > 0)  // deprecated in Caffe proto
-            {
-                int net_input_dim_size = net.input_dim_size();
-                CV_Check(net_input_dim_size, net_input_dim_size % 4 == 0, "");
-                CV_CheckEQ(net_input_dim_size, net_input_size * 4, "");
-                for (int inp_id = 0; inp_id < net_input_size; inp_id++)
-                {
-                    int dim = inp_id * 4;
-                    MatShape shape(4);
-                    shape[0] = net.input_dim(dim);
-                    shape[1] = net.input_dim(dim+1);
-                    shape[2] = net.input_dim(dim+2);
-                    shape[3] = net.input_dim(dim+3);
-                    inp_shapes.push_back(shape);
-                }
-            }
-            else if (net.input_shape_size() > 0)  // deprecated in Caffe proto
-            {
-                int net_input_shape_size = net.input_shape_size();
-                CV_CheckEQ(net_input_shape_size, net_input_size, "");
-                for (int inp_id = 0; inp_id < net_input_shape_size; inp_id++)
-                {
-                    MatShape shape = parseBlobShape(net.input_shape(inp_id));
-                    inp_shapes.push_back(shape);
-                }
-            }
-            else
-            {
-                for (int inp_id = 0; inp_id < net_input_size; inp_id++)
-                {
-                    MatShape shape; // empty
-                    inp_shapes.push_back(shape);
-                }
             }
         }
 
@@ -409,17 +363,6 @@ public:
                     addOutput(layer, 0, outNum);
                     addedBlobs.back().outNum = netInputs.size();
                     netInputs.push_back(addedBlobs.back().name);
-                }
-                if (layer.has_input_param())
-                {
-                    const caffe::InputParameter &inputParameter = layer.input_param();
-                    int input_shape_size = inputParameter.shape_size();
-                    CV_CheckEQ(input_shape_size, layer.top_size(), "");
-                    for (int inp_id = 0; inp_id < input_shape_size; inp_id++)
-                    {
-                        MatShape shape = parseBlobShape(inputParameter.shape(inp_id));
-                        inp_shapes.push_back(shape);
-                    }
                 }
                 continue;
             }
@@ -466,35 +409,6 @@ public:
                 net.mutable_layer(li)->mutable_bottom()->RemoveLast();
                 type = "Eltwise";
             }
-            else if (type == "Resample")
-            {
-                CV_Assert(layer.bottom_size() == 1 || layer.bottom_size() == 2);
-                type = "Resize";
-                String interp = toLowerCase(layerParams.get<String>("type"));
-                layerParams.set("interpolation", interp == "linear" ? "bilinear" : interp);
-
-                if (layerParams.has("factor"))
-                {
-                    float factor = layerParams.get<float>("factor");
-                    CV_Assert(layer.bottom_size() != 2 || factor == 1.0);
-                    layerParams.set("zoom_factor", factor);
-
-                    if ((interp == "linear" && factor != 1.0) ||
-                        (interp == "nearest" && factor < 1.0))
-                        CV_Error(Error::StsNotImplemented, "Unsupported Resample mode");
-                }
-            }
-            else if ("Convolution" == type)
-            {
-                CV_Assert(layer.bottom_size() == layer.top_size());
-                for (int i = 0; i < layer.bottom_size(); i++)
-                {
-                    int conv_id = dstNet.addLayer(layer.top(i), type, layerParams);
-                    addInput(layer.bottom(i), conv_id, 0, dstNet);
-                    addedBlobs.push_back(BlobNote(layer.top(i), conv_id, 0));
-                }
-                continue;
-            }
             else if ("ConvolutionDepthwise" == type)
             {
                 type = "Convolution";
@@ -510,11 +424,34 @@ public:
         }
         dstNet.setInputsNames(netInputs);
 
-        if (inp_shapes.size() > 0)
-        {
-            CV_CheckEQ(inp_shapes.size(), netInputs.size(), "");
-            for (int inp_id = 0; inp_id < inp_shapes.size(); inp_id++)
-                dstNet.setInputShape(netInputs[inp_id], inp_shapes[inp_id]);
+        std::vector<MatShape> inp_shapes;
+        if (net.input_shape_size() > 0 || (layersSize > 0 && net.layer(0).has_input_param() &&
+            net.layer(0).input_param().shape_size() > 0)) {
+
+            int size = (net.input_shape_size() > 0) ? net.input_shape_size() :
+                                                      net.layer(0).input_param().shape_size();
+            for (int inp_id = 0; inp_id < size; inp_id++)
+            {
+                const caffe::BlobShape &_input_shape = (net.input_shape_size() > 0) ?
+                                                        net.input_shape(inp_id) :
+                                                        net.layer(0).input_param().shape(inp_id);
+                MatShape shape;
+                for (int i = 0; i < _input_shape.dim_size(); i++) {
+                    shape.push_back((int)_input_shape.dim(i));
+                }
+                inp_shapes.push_back(shape);
+            }
+        }
+        else if (net.input_dim_size() > 0) {
+            MatShape shape;
+            for (int dim = 0; dim < net.input_dim_size(); dim++) {
+                shape.push_back(net.input_dim(dim));
+            }
+            inp_shapes.push_back(shape);
+        }
+
+        for (int inp_id = 0; inp_id < inp_shapes.size(); inp_id++) {
+            dstNet.setInput(Mat(inp_shapes[inp_id], CV_32F), netInputs[inp_id]);
         }
 
         addedBlobs.clear();
@@ -556,6 +493,7 @@ public:
         if (idx < 0)
         {
             CV_Error(Error::StsObjectNotFound, "Can't find output blob \"" + name + "\"");
+            return;
         }
 
         dstNet.connect(addedBlobs[idx].layerId, addedBlobs[idx].outNum, layerId, inNum);
@@ -590,23 +528,7 @@ Net readNetFromCaffe(const std::vector<uchar>& bufferProto, const std::vector<uc
                             bufferModelPtr, bufferModel.size());
 }
 
-#else  // HAVE_PROTOBUF
-
-#define DNN_PROTOBUF_UNSUPPORTED() CV_Error(Error::StsError, "DNN/Caffe: Build OpenCV with Protobuf to import Caffe models")
-
-Net readNetFromCaffe(const String &, const String &) {
-    DNN_PROTOBUF_UNSUPPORTED();
-}
-
-Net readNetFromCaffe(const char *, size_t, const char *, size_t) {
-    DNN_PROTOBUF_UNSUPPORTED();
-}
-
-Net readNetFromCaffe(const std::vector<uchar>&, const std::vector<uchar>&) {
-    DNN_PROTOBUF_UNSUPPORTED();
-}
-
-#endif  // HAVE_PROTOBUF
+#endif //HAVE_PROTOBUF
 
 CV__DNN_INLINE_NS_END
 }} // namespace
