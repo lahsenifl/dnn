@@ -40,9 +40,6 @@
 //M*/
 
 #include "../precomp.hpp"
-
-#include <opencv2/core/utils/fp_control_utils.hpp>
-
 #include <limits>
 #include <set>
 #include <map>
@@ -109,8 +106,6 @@ static inline bool endsWith(const String &str, const char *substr)
 
 struct TorchImporter
 {
-    FPDenormalsIgnoreHintScope fp_denormals_ignore_scope;
-
     typedef std::map<String, std::pair<int, Mat> > TensorsMap;
     Net net;
 
@@ -870,10 +865,15 @@ struct TorchImporter
                 layerParams.set("indices_blob_id", tensorParams["indices"].first);
                 curModule->modules.push_back(newModule);
             }
-            else if (nnName == "LogSoftMax" || nnName == "SoftMax")
+            else if (nnName == "SoftMax")
             {
-                newModule->apiType = "Softmax";
-                layerParams.set("log_softmax", nnName == "LogSoftMax");
+                newModule->apiType = "SoftMax";
+                curModule->modules.push_back(newModule);
+            }
+            else if (nnName == "LogSoftMax")
+            {
+                newModule->apiType = "SoftMax";
+                layerParams.set("log_softmax", true);
                 curModule->modules.push_back(newModule);
             }
             else if (nnName == "SpatialCrossMapLRN")
@@ -954,7 +954,7 @@ struct TorchImporter
                 int size = scalarParams.get<int>("size");
 
                 int begins[] = {0, 0, size, size};
-                int ends[] = {INT_MAX, INT_MAX, -size, -size};
+                int ends[] = {-1, -1, -size - 1, -size - 1};
 
                 newModule->apiType = "Slice";
                 layerParams.set("begin", DictValue::arrayInt<int*>(&begins[0], 4));

@@ -63,17 +63,17 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
     template <class Kernel, typename ...Args> inline
     void launch_kernel(Kernel kernel, Args ...args) {
         auto policy = make_policy(kernel);
-        kernel <<<policy.grid, policy.block>>> (args...);
+        kernel <<<policy.grid, policy.block>>> (std::forward<Args>(args)...);
     }
 
     template <class Kernel, typename ...Args> inline
     void launch_kernel(Kernel kernel, dim3 grid, dim3 block, Args ...args) {
-        kernel <<<grid, block>>> (args...);
+        kernel <<<grid, block>>> (std::forward<Args>(args)...);
     }
 
     template <class Kernel, typename ...Args> inline
     void launch_kernel(Kernel kernel, execution_policy policy, Args ...args) {
-        kernel <<<policy.grid, policy.block, policy.sharedMem, policy.stream>>> (args...);
+        kernel <<<policy.grid, policy.block, policy.sharedMem, policy.stream>>> (std::forward<Args>(args)...);
     }
 
 }}}} /* namespace cv::dnn::cuda4dnn::csl */

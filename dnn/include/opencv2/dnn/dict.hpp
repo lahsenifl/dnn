@@ -44,13 +44,14 @@
 #include <ostream>
 
 #include <opencv2/dnn/dnn.hpp>
+#include <opencv2/dnn/dnn_serialization.h>
 
 #ifndef OPENCV_DNN_DNN_DICT_HPP
 #define OPENCV_DNN_DNN_DICT_HPP
 
 namespace cv {
 namespace dnn {
-CV__DNN_INLINE_NS_BEGIN
+    CV__DNN_INLINE_NS_BEGIN
 //! @addtogroup dnn
 //! @{
 
@@ -60,13 +61,13 @@ CV__DNN_INLINE_NS_BEGIN
 struct CV_EXPORTS_W DictValue
 {
     DictValue(const DictValue &r);
-    explicit DictValue(bool i)           : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i ? 1 : 0; }       //!< Constructs integer scalar
-    explicit DictValue(int64 i = 0)      : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i; }       //!< Constructs integer scalar
-    CV_WRAP explicit DictValue(int i)    : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i; }       //!< Constructs integer scalar
-    explicit DictValue(unsigned p)       : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = p; }       //!< Constructs integer scalar
-    CV_WRAP explicit DictValue(double p)         : type(Param::REAL), pd(new AutoBuffer<double,1>) { (*pd)[0] = p; }     //!< Constructs floating point scalar
-    CV_WRAP explicit DictValue(const String &s)  : type(Param::STRING), ps(new AutoBuffer<String,1>) { (*ps)[0] = s; }   //!< Constructs string scalar
-    explicit DictValue(const char *s)            : type(Param::STRING), ps(new AutoBuffer<String,1>) { (*ps)[0] = s; }   //!< @overload
+    DictValue(bool i)           : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i ? 1 : 0; }       //!< Constructs integer scalar
+    DictValue(int64 i = 0)      : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i; }       //!< Constructs integer scalar
+    CV_WRAP DictValue(int i)    : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i; }       //!< Constructs integer scalar
+    DictValue(unsigned p)       : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = p; }       //!< Constructs integer scalar
+    CV_WRAP DictValue(double p)         : type(Param::REAL), pd(new AutoBuffer<double,1>) { (*pd)[0] = p; }     //!< Constructs floating point scalar
+    CV_WRAP DictValue(const String &s)  : type(Param::STRING), ps(new AutoBuffer<String,1>) { (*ps)[0] = s; }   //!< Constructs string scalar
+    DictValue(const char *s)            : type(Param::STRING), ps(new AutoBuffer<String,1>) { (*ps)[0] = s; }   //!< @overload
 
     template<typename TypeIter>
     static DictValue arrayInt(TypeIter begin, int size);    //!< Constructs integer array
@@ -94,6 +95,43 @@ struct CV_EXPORTS_W DictValue
 
     ~DictValue();
 
+    static DictValue io_generic(/*dnn_serialization::*/DnnReader &a2)
+    {
+        DictValue v6; // [sp+0h] [bp-30h]
+        int v8; // [sp+14h] [bp-1Ch]
+        int v9; // [sp+18h] [bp-18h]
+
+        v9 = v6.size();
+        a2.io(&v9);        
+        a2.io(&v8);
+        switch ((Param)v8)
+        {
+        case Param::STRING:
+        {
+            vector<String> v7(v9);
+            /*dnn_serialization::*/io_vec_String(a2, v7);
+            v6 = DictValue::arrayString(v7.begin(), v9);
+            break;
+        }
+        case Param::REAL:
+        {
+            vector<double> v7(v9);
+            /*dnn_serialization::*/io(a2, v7);
+            v6 = DictValue::arrayReal(v7.begin(), v9);
+            break;
+        }
+        case Param::INT:
+        {
+            std::vector<int> v7(v9);
+            /*dnn_serialization::*/io_vec_int(a2, v7);
+            v6 = DictValue::arrayInt(v7.begin(), v9);
+            break;
+        }
+        }
+        v6.type = (Param)v8;
+        return v6;
+    };
+
 private:
 
     Param type;
@@ -113,6 +151,8 @@ private:
 /** @brief This class implements name-value dictionary, values are instances of DictValue. */
 class CV_EXPORTS Dict
 {
+public:
+
     typedef std::map<String, DictValue> _Dict;
     _Dict dict;
 

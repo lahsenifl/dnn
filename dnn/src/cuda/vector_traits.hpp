@@ -8,7 +8,6 @@
 #include <cuda_runtime.h>
 
 #include "types.hpp"
-#include "memory.hpp"
 
 #include "../cuda4dnn/csl/pointer.hpp"
 
@@ -85,16 +84,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace de
     template <class V>
     __device__ void v_load(V& dest, const V* src) {
         dest.raw = src->raw;
-    }
-
-    template <class V>
-    __device__ void v_load_ldg(V& dest, const V& src) {
-        dest.raw = load_ldg(src.raw);
-    }
-
-    template <class V>
-    __device__ void v_load_ldg(V& dest, const V* src) {
-        dest.raw = load_ldg(src->raw);
     }
 
     template <class V>
