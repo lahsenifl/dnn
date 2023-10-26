@@ -490,6 +490,12 @@ struct LayerPin
     LayerPin(int layerId = -1, int outputId = -1)
         : lid(layerId), oid(outputId) {}
 
+    void io_generic(/*dnn_serialization::*/DnnReader &a2)
+    {
+        a2.io(&lid);
+        a2.io(&oid);
+    }
+
     bool valid() const
     {
         return (lid >= 0 && oid >= 0);
@@ -511,6 +517,46 @@ struct LayerPin
     }
 };
 
+void /*dnn_serialization::*/io_vec_LayerPin(/*dnn_serialization::*/DnnReader &a1, std::vector</*cv::dnn::*/LayerPin> &a2)
+{
+    int nLayerPins = a2.size();
+    a1.io(&nLayerPins);
+    if (nLayerPins != a2.size())
+        a2.resize(nLayerPins);
+    for (int i = 0; i < nLayerPins; ++i)
+    {
+        a2[i].io_generic(a1);
+    }
+};
+
+void /*dnn_serialization::*/io_map_StrDict(/*dnn_serialization::*/DnnReader &a1, std::map<String, DictValue> &r1_0)
+{
+    String v8;
+    unsigned int nDictValCnt = r1_0.size();
+    a1.io(&nDictValCnt);
+    for (int i = 0; i < nDictValCnt; ++i)
+    {
+        io(a1, v8);
+        r1_0[v8] = DictValue::io_generic(a1);
+    }
+}
+
+void LayerParams::io_generic(/*dnn_serialization::*/DnnReader &r1_0)
+{
+    int nMatCnt;
+    /*dnn_serialization::*/io(r1_0, name);
+    /*dnn_serialization::*/io(r1_0, type);
+    nMatCnt = blobs.size();
+    r1_0.io(&nMatCnt);
+    if (blobs.size() != nMatCnt)
+        blobs.resize(nMatCnt);
+    for (int i = 0; i < nMatCnt; ++i)
+    {
+        /*dnn_serialization::*/io(r1_0, blobs[i]);
+    }
+    /*dnn_serialization::*/io_map_StrDict(r1_0, dict);
+}
+
 struct LayerData
 {
     LayerData() : id(-1), skip(false), flag(0) {}
@@ -522,6 +568,20 @@ struct LayerData
         //add logging info
         params.name = name;
         params.type = type;
+    }
+
+    //io_generic
+    void io_generic(/*dnn_serialization::*/DnnReader &a2)
+    {
+        a2.io(&id);
+        /*dnn_serialization::*/io(a2, name);
+        /*dnn_serialization::*/io(a2, type);
+        params.io_generic(a2);
+        /*dnn_serialization::*/io(a2, internals);
+        /*dnn_serialization::*/io_vec_LayerPin(a2, inputBlobsId);
+        /*dnn_serialization::*/io_set_int(a2, inputLayersId);
+        /*dnn_serialization::*/io_set_int(a2, requiredOutputs);
+        /*dnn_serialization::*/io_vec_LayerPin(a2, consumers);
     }
 
     int id;
@@ -563,6 +623,23 @@ struct LayerData
         }
 
         return layerInstance;
+    }
+};
+
+void /*dnn_serialization::*/io_map_LayerData(DnnReader &a1, std::map<int, LayerData> &r1_0)
+{
+    unsigned int i; // r10
+    int v8; // [sp+D4h] [bp-3Ch]
+    unsigned int a2; // [sp+D8h] [bp-38h]
+
+    a2 = r1_0.size();
+    a1.io(&a2);
+    for (i = 0; i < a2; ++i)
+    {
+        LayerData v7; // [sp+20h] [bp-F0h]
+        a1.io(&v8);
+        v7.io_generic(a1);
+        r1_0[v8] = v7;
     }
 };
 
@@ -1115,7 +1192,33 @@ struct Net::Impl
 #endif
     }
 
+    int io(/*dnn_serialization::*/DnnReader &dnnReader)
+    {
+        int v7; // [sp+0h] [bp-18h]
+        unsigned char ubFlag;
+
+        dnnReader.io(&preferableBackend);
+        dnnReader.io(&lastLayerId);
+        dnnReader.io(&ubFlag);
+        netWasAllocated = ubFlag;
+        dnnReader.io(&ubFlag);
+        fusion = ubFlag;
+
+        /*dnn_serialization::*/io_vec_int(dnnReader, m_vfield_8);
+        /*dnn_serialization::*/io_vec_LayerPin(dnnReader, blobsToKeep);
+        /*dnn_serialization::*/io_map_LayerData(dnnReader, layers);
+        v7 = 0;
+        layers[v7].layerInstance = netInputLayer;
+
+        /*dnn_serialization::*/io_map_String_int(dnnReader, layerNameToId);
+
+        return 0;
+    }
+
     Ptr<DataLayer> netInputLayer;
+    ////////////
+    std::vector<int> m_vfield_8;
+    ////////////
     std::vector<LayerPin> blobsToKeep;
     MapIdToLayerData layers;
     std::map<String, int> layerNameToId;
@@ -4268,6 +4371,12 @@ int64 Net::getPerfProfile(std::vector<double>& timings)
     int64 total = (int64)std::accumulate(timings.begin(), timings.end(), 0.0);
     return total;
 }
+
+void Net::io(DnnReader &dnnReader)
+{
+    impl->io(dnnReader);
+}
+
 
 //////////////////////////////////////////////////////////////////////////
 

@@ -107,6 +107,8 @@ CV__DNN_INLINE_NS_BEGIN
     class CV_EXPORTS LayerParams : public Dict
     {
     public:
+        void io_generic(/*dnn_serialization::*/DnnReader &r1_0);
+        
         //TODO: Add ability to name blob params
         std::vector<Mat> blobs; //!< List of learned parameters stored as blobs.
 
@@ -723,6 +725,11 @@ CV__DNN_INLINE_NS_BEGIN
          * @return overall ticks for model inference.
          */
         CV_WRAP int64 getPerfProfile(CV_OUT std::vector<double>& timings);
+
+
+        CV_WRAP void io(DnnReader &dnnReader);
+
+
 
     private:
         struct Impl;
